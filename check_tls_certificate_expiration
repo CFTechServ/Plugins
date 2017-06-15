@@ -1,0 +1,243 @@
+#!/usr/bin/perl
+#
+# check_tls_certificate_expiration - Check for nagios/icinga/icinga2 to check TLS Certificates
+# Copyright (C) 2015  Josef 'veloc1ty' Stautner (hello@veloc1ty.de)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Date::Calc qw(Delta_Days Parse_Date Today);
+use Crypt::OpenSSL::X509;
+
+# Basic Arguments
+our $ARG_WARNING_DAYS = 21;
+our $ARG_CRITICAL_DAYS = 14;
+
+# Arguments for network check
+our $ARG_ADDRESS = '';
+our $ARG_HOSTNAME = ''; # Only used for HTTP SNI
+our $ARG_PORT = 443;
+our $ARG_OPENSSL = '/usr/bin/openssl';
+
+# Argument for file check
+our $ARG_FILE = '';
+our $ARG_COMMON_NAME = '';
+
+main();
+
+sub main {
+	parseArguments();
+	my $certificate = retrieveCertificate();
+
+	my $x509 = Crypt::OpenSSL::X509->new_from_string(
+		$certificate, Crypt::OpenSSL::X509::FORMAT_PEM
+	);
+
+	decideExitCode(
+		calculateDaysLeft($x509->notAfter()),
+		extractCommonName($x509->subject())
+		);
+}
+
+sub decideExitCode {
+	my ( $daysLeft, $commonName ) = @_;
+
+	if ( length($ARG_COMMON_NAME) != 0 ) {
+		# Common name check wanted
+		if ( $ARG_COMMON_NAME ne $commonName ) {
+			printf("CRITICAL - Common name does not match. Got: %s\n",
+				$commonName);
+			exit(2);
+		}
+	}
+
+	# Check if certificate is already expired
+	# Display an appropriate string then
+	if ( $daysLeft <= 0 ) {
+		printf("CRITICAL - Certificate is expired\n");
+		exit(2);
+	}
+
+	# Days left check
+	if ( $daysLeft <= $ARG_CRITICAL_DAYS ) {
+		printf("CRITICAL - %d days left\n", $daysLeft);
+		exit(2);
+	}
+	elsif ( $daysLeft <= $ARG_WARNING_DAYS ) {
+		printf("WARNING - %d days left\n", $daysLeft);
+		exit(1);
+	}
+	else {
+		printf("OK - %d days left\n", $daysLeft);
+		exit(0);
+	}
+}
+
+sub parseArguments {
+	GetOptions (
+		'address=s' => \$ARG_ADDRESS,
+		'port=s' => \$ARG_PORT,
+		'hostname=s' => \$ARG_HOSTNAME,
+		'common-name=s' => \$ARG_COMMON_NAME,
+		'file=s' => \$ARG_FILE,
+		'warn=i' => \$ARG_WARNING_DAYS,
+		'crit=i' => \$ARG_CRITICAL_DAYS,
+		'openssl=s' => \$ARG_OPENSSL
+	);
+
+	validateArguments();
+}
+
+sub validateArguments {
+	# Common Arguments
+	if ( ! isInteger($ARG_WARNING_DAYS) ) {
+		exitUnknown("Argument --warn is not numeric");
+	}
+
+	if ( ! isInteger($ARG_CRITICAL_DAYS) ) {
+		exitUnknown("Argument --crit is not numeric");
+	}
+
+	if ( $ARG_CRITICAL_DAYS > $ARG_WARNING_DAYS ) {
+		exitUnknown(sprintf(
+			'Critical value (%d) is greater than warning value (%d)',
+			$ARG_CRITICAL_DAYS,
+			$ARG_WARNING_DAYS
+			));
+	}
+
+	# Decide which mode
+	if ( length ($ARG_FILE) == 0 ) {
+		# Network mode
+		# Validate network parameter
+		validateNetworkArguments();
+	}
+	else {
+		# File mode
+		# Validate file parameter
+		validateFileArguments();
+	}
+}
+
+sub validateNetworkArguments {
+	if ( ! -e $ARG_OPENSSL ) {
+		exitUnknown(sprintf("OpenSSL not found under %s", $ARG_OPENSSL));
+	}
+
+	if ( length($ARG_ADDRESS) == 0) {
+		exitUnknown("Argument --address is not set");
+	}
+
+	if ( ! isInteger($ARG_PORT) ) {
+		exitUnknown("Argument --port is not numeric");
+	}
+
+	if ( $ARG_PORT <= 0 || $ARG_PORT >= 65535 ) {
+		exitUnknown("Argument --port is out of bounds! Valid: 1-65535");
+	}
+}
+
+sub validateFileArguments {
+	if ( ! -e $ARG_FILE ) {
+		exitUnknown(sprintf(
+			"Certificate under %s not found",
+			$ARG_FILE
+			));
+	}
+}
+
+sub isInteger {
+	my $possibleInteger = shift;
+
+	return 1 if ( $possibleInteger =~ /\d+/ );
+	return 0;
+}
+
+sub exitUnknown {
+	printf("UNKNOWN - %s\n", shift);
+	exit 3;
+}
+
+sub retrieveCertificate {
+	my $certificate = '';
+
+	if ( length($ARG_FILE) == 0 ) {
+		# Network mode
+		# Fetch certificate and return it as a string
+
+		# Check if we have to set SNI
+		my $sniPart = '';
+
+		if ( length($ARG_HOSTNAME) != 0 ) {
+			$sniPart = sprintf("-servername %s", $ARG_HOSTNAME);
+		}
+
+		# Build command
+		my $command = sprintf(
+			"echo \"\" | %s s_client -connect %s:%d %s 2> /dev/null | %s x509 2> /dev/null",
+			$ARG_OPENSSL,
+			$ARG_ADDRESS,
+			$ARG_PORT,
+			$sniPart,
+			$ARG_OPENSSL
+			);
+
+		$certificate = `$command`;
+	}
+	else {
+		# File mode
+		# Fetch certificate from file and return it as string
+		open(CERT, $ARG_FILE);
+		my $line = '';
+
+		while ( $line = <CERT> ) {
+			$certificate .= $line;
+		}
+
+		close(CERT);
+	}
+
+	if ( $certificate !~ /BEGIN CERTIFICATE/ ) {
+		exitUnknown("Didn't receive a certificate");
+	}
+
+	return $certificate;
+}
+
+sub calculateDaysLeft {
+	my $expireDate = shift;
+
+	my ($year, $month, $day) = Parse_Date($expireDate);
+	my ( $nowYear, $nowMonth, $nowDay) = Today();
+
+	return Delta_Days($nowYear, $nowMonth, $nowDay,
+		$year, $month, $day);
+}
+
+sub extractCommonName {
+	my $possibleCommonName = shift;
+
+	if ( $possibleCommonName =~ m/CN=(.*)/ ) {
+		# Strip possible E-Mail address
+        my $cn = $1;
+        $cn =~ s/,.*//;
+
+        return $cn;
+	}
+	else {
+		exitUnknown("No common name given");
+	}
+}
